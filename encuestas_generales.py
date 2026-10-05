@@ -48,6 +48,8 @@ SOLO_CON_ESCANOS = True           # igual que filter(!is.na(Diputados)) en R
 RENOMBRAR_PARTIDOS = {"Vox": "VOX"}
 # Filas que no son encuestas (además de cualquier fila de resultados "... election")
 EXCLUIR_ENCUESTADORES = {"PP", "PSOE"}
+# Columnas entre Turnout y Lead que no son partidos
+NO_PARTIDOS = {"Question", "X mark", "Others", "Other", "Blank", "Undecided", "Abstention"}
 
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 DW_API = "https://api.datawrapper.de/v3"
@@ -63,14 +65,23 @@ def limpiar(texto: str) -> str:
     return re.sub(r"\s+", " ", texto).strip()
 
 
-def descargar_html() -> str:
+class TablaNoEncontrada(RuntimeError):
+    pass
+
+
+def obtener_tabla() -> pd.DataFrame:
+    """Prueba cada URL hasta encontrar una tabla de estimación de voto."""
     for url in URLS:
         r = requests.get(url, headers=HEADERS_WIKI, timeout=60)
-        if r.status_code == 200:
-            print(f"Página leída: {r.url}")
-            return r.text
-        print(f"Aviso: {url} devolvió {r.status_code}", file=sys.stderr)
-    raise RuntimeError("No se ha podido descargar ninguna de las páginas de Wikipedia")
+        if r.status_code != 200:
+            print(f"Aviso: {url} devolvió {r.status_code}", file=sys.stderr)
+            continue
+        print(f"Página leída: {r.url}")
+        try:
+            return leer_tabla_sondeos(r.text)
+        except TablaNoEncontrada as e:
+            print(f"Aviso: {e} en {r.url}", file=sys.stderr)
+    raise RuntimeError("Ninguna página de Wikipedia tiene la tabla de estimación de voto")
 
 
 def _int(valor) -> int:
@@ -135,9 +146,14 @@ def leer_tabla_sondeos(html: str) -> pd.DataFrame:
         if (any(c.startswith("Polling firm") for c in cab)
                 and any(c.startswith("Fieldwork") for c in cab)
                 and "PP" in cab and "PSOE" in cab):
-            candidatas.append((cab, rejilla))
+            # Solo las tablas de estimación de voto tienen columna Turnout;
+            # las de voto directo, preferencias, etc. se descartan
+            valida = any(c.startswith("Turnout") for c in cab)
+            print(f"  Tabla {'OK ' if valida else 'descartada'} | {len(rejilla)} filas | {cab}")
+            if valida:
+                candidatas.append((cab, rejilla))
     if not candidatas:
-        raise RuntimeError("No se encuentra la tabla de sondeos en la página")
+        raise TablaNoEncontrada("No hay tabla de estimación de voto (con columna Turnout)")
 
     # La tabla principal es la más larga; se suman las que tengan la misma cabecera
     # (por si Wikipedia la parte por años)
@@ -198,7 +214,7 @@ def preparar_encuestas(df: pd.DataFrame) -> pd.DataFrame:
     c_part = next((c for c in cols if c.startswith("Turnout")), c_muestra)
     c_lead = next((c for c in cols if c.startswith("Lead")), None)
     i_fin = cols.index(c_lead) if c_lead else len(cols)
-    partidos = cols[cols.index(c_part) + 1:i_fin]
+    partidos = [c for c in cols[cols.index(c_part) + 1:i_fin] if c not in NO_PARTIDOS]
     print(f"Partidos: {partidos}")
 
     df = df.rename(columns={c_enc: "Encuestador", c_muestra: "Muestra"})
@@ -285,7 +301,7 @@ def dw_subir_y_publicar(chart_id: str, df: pd.DataFrame, nombre: str):
 
 
 def main():
-    encuestas = preparar_encuestas(leer_tabla_sondeos(descargar_html()))
+    encuestas = preparar_encuestas(obtener_tabla())
     if encuestas.empty:
         raise RuntimeError("No hay encuestas tras la limpieza; revisa la estructura de la tabla")
 
