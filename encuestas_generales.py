@@ -44,7 +44,10 @@ CHART_SEMANAL = os.getenv("DW_CHART_SEMANAL") or "XXXXX"
 VENTANA_MEDIA = 5                 # zoo::rollmean(k = 5)
 ANYOS_MEDIA = [2026]              # filtro del gráfico de media móvil
 ANYOS_SEMANAL = ["2025", "2026"]  # filtro del gráfico semanal
-SOLO_CON_ESCANOS = True           # igual que filter(!is.na(Diputados)) en R
+# El JSON incluye todas las encuestas con % de voto (tengan o no escaños).
+# Los gráficos de Datawrapper mantienen el filtro del script de R
+# (filter(!is.na(Diputados))): solo encuestas con escaños.
+SOLO_CON_ESCANOS_DATAWRAPPER = True
 
 # Nombres de Wikipedia -> nombres en los gráficos
 RENOMBRAR_PARTIDOS = {"Vox": "VOX"}
@@ -302,10 +305,7 @@ def preparar_encuestas(tablas: list) -> pd.DataFrame:
     largo["Porcentaje"] = pv.map(lambda t: t[0]).astype("Float64")
     largo["Diputados"] = pv.map(lambda t: t[1])
 
-    if SOLO_CON_ESCANOS:
-        largo = largo[largo["Diputados"].notna()]
-    else:
-        largo = largo[largo["Porcentaje"].notna() | largo["Diputados"].notna()]
+    largo = largo[largo["Porcentaje"].notna() | largo["Diputados"].notna()]
 
     largo["Encuestador"] = largo["Encuestador"].map(limpiar)
     es_resultado = largo["Encuestador"].str.contains(r"\belection\b", case=False, na=False)
@@ -406,7 +406,7 @@ def construir_json(encuestas, media, semana) -> dict:
         for _, r in g.iterrows():
             e_min, e_max = _escanos(r["Diputados"])
             resultados.append({"partido": r["Partidos"], "porcentaje": _num(r["Porcentaje"], 1),
-                               "escanos": r["Diputados"], "escanos_min": e_min, "escanos_max": e_max})
+                               "escanos": None if pd.isna(r["Diputados"]) else r["Diputados"], "escanos_min": e_min, "escanos_max": e_max})
         lista.append({"encuestador": enc, "fecha": fecha.strftime("%Y-%m-%d"),
                       "muestra": _muestra(muestra), "resultados": resultados})
 
@@ -439,7 +439,7 @@ def guardar_json(datos: dict) -> bool:
             pass
     salida = {"actualizado": datetime.now(timezone.utc).isoformat(timespec="seconds"), **datos}
     RUTA_JSON.parent.mkdir(parents=True, exist_ok=True)
-    RUTA_JSON.write_text(json.dumps(salida, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    RUTA_JSON.write_text(json.dumps(salida, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8")
     print(f"{RUTA_JSON}: actualizado ({RUTA_JSON.stat().st_size // 1024} KB, {len(datos['encuestas'])} encuestas)")
     return True
 
@@ -452,12 +452,14 @@ def main():
     unicas = encuestas.drop_duplicates(["Encuestador", "Fecha_fin"])
     print("Encuestas por año:", unicas.groupby(unicas["Fecha_fin"].dt.year).size().to_dict())
     print("Más reciente:", encuestas["Fecha_fin"].max().date())
-    media, semana = media_movil(encuestas), media_semanal(encuestas)
-    guardar_json(construir_json(encuestas, media, semana))
+    # JSON: todas las encuestas con % de voto
+    guardar_json(construir_json(encuestas, media_movil(encuestas), media_semanal(encuestas)))
 
-    dw_subir_y_publicar(CHART_ENCUESTAS, encuestas, "encuestas")
-    dw_subir_y_publicar(CHART_MEDIA, media, "media_movil")
-    dw_subir_y_publicar(CHART_SEMANAL, semana, "media_semanal")
+    # Datawrapper: como en el script de R
+    dw = encuestas[encuestas["Diputados"].notna()] if SOLO_CON_ESCANOS_DATAWRAPPER else encuestas
+    dw_subir_y_publicar(CHART_ENCUESTAS, dw, "encuestas")
+    dw_subir_y_publicar(CHART_MEDIA, media_movil(dw), "media_movil")
+    dw_subir_y_publicar(CHART_SEMANAL, media_semanal(dw), "media_semanal")
 
 
 if __name__ == "__main__":
