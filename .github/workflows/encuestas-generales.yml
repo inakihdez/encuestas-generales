@@ -5,6 +5,13 @@ on:
     - cron: "0 7,15 * * *"   # 9:00 y 17:00 en horario de verano peninsular (UTC+2)
   workflow_dispatch:
 
+permissions:
+  contents: write            # necesario para subir datos/encuestas.json
+
+concurrency:
+  group: encuestas-generales # evita dos ejecuciones a la vez empujando al repo
+  cancel-in-progress: false
+
 jobs:
   actualizar:
     runs-on: ubuntu-latest
@@ -19,10 +26,22 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Actualizar gráficos de Datawrapper
+      - name: Descargar encuestas, generar JSON y actualizar Datawrapper
         run: python encuestas_generales.py
         env:
           DATAWRAPPER_API_KEY: ${{ secrets.DATAWRAPPER_API_KEY }}
           DW_CHART_ENCUESTAS: ${{ vars.DW_CHART_ENCUESTAS }}
           DW_CHART_MEDIA: ${{ vars.DW_CHART_MEDIA }}
           DW_CHART_SEMANAL: ${{ vars.DW_CHART_SEMANAL }}
+
+      - name: Subir el JSON si ha cambiado
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add datos/encuestas.json
+          if git diff --staged --quiet; then
+            echo "Sin cambios en los datos"
+          else
+            git commit -m "Encuestas actualizadas $(date -u +'%Y-%m-%d %H:%M') UTC"
+            git push
+          fi
