@@ -131,6 +131,15 @@ def texto_cabecera(th) -> str:
     return limpiar(a.get("title", "")) if a else ""
 
 
+def anyo_seccion(tabla):
+    """Año del título de sección inmediatamente anterior a la tabla ('2026'), o None."""
+    h = tabla.find_previous(["h2", "h3", "h4"])
+    if h is None:
+        return None
+    m = re.fullmatch(r"(\d{4})", limpiar(h.get_text(" ", strip=True)))
+    return m.group(1) if m else None
+
+
 def leer_tabla_sondeos(html: str) -> list:
     soup = BeautifulSoup(html, "lxml")
     # Fuera notas al pie y textos ocultos (claves de ordenación)
@@ -149,16 +158,24 @@ def leer_tabla_sondeos(html: str) -> list:
             # Solo las tablas de estimación de voto tienen columna Turnout;
             # las de voto directo, preferencias, etc. se descartan
             valida = any(c.startswith("Turnout") for c in cab)
-            print(f"  Tabla {'OK ' if valida else 'descartada'} | {len(rejilla)} filas | {cab}")
+            seccion = anyo_seccion(tabla)
+            print(f"  Tabla {'con Turnout' if valida else 'sin Turnout'} | sección {seccion or '-'} "
+                  f"| {len(rejilla)} filas | {cab}")
             if valida:
-                candidatas.append((cab, rejilla))
+                candidatas.append((cab, rejilla, seccion))
     if not candidatas:
         raise TablaNoEncontrada("No hay tabla de estimación de voto (con columna Turnout)")
+
+    # Las tablas principales están bajo secciones con un año (2026, 2025...).
+    # Las demás (escenarios hipotéticos, etc.) se descartan si existen las anuales.
+    if any(sec for _, _, sec in candidatas):
+        candidatas = [c for c in candidatas if c[2]]
+    print(f"Secciones usadas: {[sec for _, _, sec in candidatas]}")
 
     # Wikipedia parte la tabla por años (2026, 2025...) y cada una puede tener
     # columnas distintas, así que se devuelven todas y se procesan por separado
     tablas = []
-    for cab, rejilla in candidatas:
+    for cab, rejilla, seccion in candidatas:
         cab = [c or f"col_{i}" for i, c in enumerate(cab)]
         registros = []
         for fila in rejilla[1:]:
@@ -167,7 +184,9 @@ def leer_tabla_sondeos(html: str) -> list:
                 continue  # filas de cabecera / colores
             registros.append([limpiar(x.get_text(" ", strip=True)) if x is not None else "" for x in fila])
         if registros:
-            tablas.append(pd.DataFrame(registros, columns=cab))
+            t = pd.DataFrame(registros, columns=cab)
+            t.attrs["anyo"] = seccion
+            tablas.append(t)
     print(f"Tablas usadas: {len(tablas)} | Filas totales: {sum(len(t) for t in tablas)}")
     return tablas
 
@@ -175,14 +194,19 @@ def leer_tabla_sondeos(html: str) -> list:
 # --------------------------------------------------------------------------
 # Limpieza
 # --------------------------------------------------------------------------
-def parse_fecha_campo(x: str):
-    """'24–26 Sep 2026' -> 2026-09-26 ; '28 Dec 2025–3 Jan 2026' -> 2026-01-03"""
+def parse_fecha_campo(x: str, anyo_defecto=None):
+    """'24–26 Sep 2026' -> 2026-09-26 ; '28 Dec 2025–3 Jan 2026' -> 2026-01-03
+    '29 Sep–1 Oct' en la tabla de 2026 -> 2026-10-01 (año de la sección)"""
     x = limpiar(x)
     segunda = re.split(r"[–—-]", x)[-1].strip()
     if not re.search(r"\d{4}", segunda):
         anyo = re.search(r"(\d{4})$", x)
         if anyo:
             segunda = f"{segunda} {anyo.group(1)}"
+        elif anyo_defecto:
+            segunda = f"{segunda} {anyo_defecto}"
+        else:
+            return pd.NaT
     for fmt in ("%d %b %Y", "%d %B %Y"):
         try:
             return pd.to_datetime(segunda, format=fmt)
@@ -205,6 +229,7 @@ def parse_voto(celda: str):
 
 
 def tabla_a_largo(df: pd.DataFrame) -> pd.DataFrame:
+    anyo = df.attrs.get("anyo")
     cols = list(df.columns)
     c_enc = cols[0]
     c_fecha = next(c for c in cols if c.startswith("Fieldwork"))
@@ -213,10 +238,10 @@ def tabla_a_largo(df: pd.DataFrame) -> pd.DataFrame:
     c_lead = next((c for c in cols if c.startswith("Lead")), None)
     i_fin = cols.index(c_lead) if c_lead else len(cols)
     partidos = [c for c in cols[cols.index(c_part) + 1:i_fin] if c not in NO_PARTIDOS]
-    print(f"  Partidos: {partidos}")
+    print(f"  Tabla {anyo or '-'} | partidos: {partidos}")
 
     df = df.rename(columns={c_enc: "Encuestador", c_muestra: "Muestra"})
-    df["Fecha_fin"] = df[c_fecha].map(parse_fecha_campo)
+    df["Fecha_fin"] = df[c_fecha].map(lambda x: parse_fecha_campo(x, anyo))
     df = df[["Encuestador", "Fecha_fin", "Muestra"] + partidos]
 
     return df.melt(id_vars=["Encuestador", "Fecha_fin", "Muestra"],
