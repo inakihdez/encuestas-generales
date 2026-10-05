@@ -1,0 +1,28 @@
+name: Encuestas elecciones generales
+
+on:
+  schedule:
+    - cron: "0 7,15 * * *"   # 9:00 y 17:00 en horario de verano peninsular (UTC+2)
+  workflow_dispatch:
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Actualizar gráficos de Datawrapper
+        run: python encuestas_generales.py
+        env:
+          DATAWRAPPER_API_KEY: ${{ secrets.DATAWRAPPER_API_KEY }}
+          DW_CHART_ENCUESTAS: ${{ vars.DW_CHART_ENCUESTAS }}
+          DW_CHART_MEDIA: ${{ vars.DW_CHART_MEDIA }}
+          DW_CHART_SEMANAL: ${{ vars.DW_CHART_SEMANAL }}
