@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 # --------------------------------------------------------------------------
 # Configuración
@@ -128,16 +128,41 @@ def texto_cabecera(th) -> str:
     if img and img.get("alt"):
         return limpiar(img["alt"])
     a = th.find("a")
-    return limpiar(a.get("title", "")) if a else ""
+    return re.sub(r"\s*\(.*?\)$", "", limpiar(a.get("title", ""))) if a else ""
 
 
 def anyo_seccion(tabla):
-    """Año del título de sección inmediatamente anterior a la tabla ('2026'), o None."""
+    """Año de la tabla: caption, o un texto que sea solo un año ('2026') entre la
+    tabla anterior y esta (título de sección, negrita, div...). None si no hay."""
+    cap = tabla.find("caption")
+    if cap:
+        m = re.search(r"\b(20\d{2})\b", limpiar(cap.get_text(" ", strip=True)))
+        if m:
+            return m.group(1)
+    for i, el in enumerate(tabla.previous_elements):
+        if i > 400:
+            break
+        if isinstance(el, NavigableString):
+            padre = el.find_parent("table")
+            if padre is not None and padre is not tabla:
+                break  # hemos llegado a la tabla anterior
+            t = limpiar(str(el))
+            if re.fullmatch(r"20\d{2}", t):
+                return t
+    return None
+
+
+def titulo_seccion(tabla) -> str:
     h = tabla.find_previous(["h2", "h3", "h4"])
-    if h is None:
-        return None
-    m = re.fullmatch(r"(\d{4})", limpiar(h.get_text(" ", strip=True)))
-    return m.group(1) if m else None
+    return limpiar(h.get_text(" ", strip=True)) if h else ""
+
+
+ESCENARIOS = re.compile(r"hypothetical|scenario|alternative|if .* ran", re.I)
+
+
+def anyo_mas_frecuente(fechas: pd.Series):
+    anyos = fechas.str.findall(r"\b(20\d{2})\b").explode().dropna()
+    return anyos.mode().iloc[0] if not anyos.empty else None
 
 
 def leer_tabla_sondeos(html: str) -> list:
@@ -159,18 +184,34 @@ def leer_tabla_sondeos(html: str) -> list:
             # las de voto directo, preferencias, etc. se descartan
             valida = any(c.startswith("Turnout") for c in cab)
             seccion = anyo_seccion(tabla)
-            print(f"  Tabla {'con Turnout' if valida else 'sin Turnout'} | sección {seccion or '-'} "
+            titulo = titulo_seccion(tabla)
+            escenario = bool(ESCENARIOS.search(titulo))
+            estado = "OK" if valida and not escenario else ("escenario" if escenario else "sin Turnout")
+            print(f"  Tabla {estado} | año {seccion or '-'} | título «{titulo}» "
                   f"| {len(rejilla)} filas | {cab}")
-            if valida:
+            if valida and not escenario:
                 candidatas.append((cab, rejilla, seccion))
     if not candidatas:
         raise TablaNoEncontrada("No hay tabla de estimación de voto (con columna Turnout)")
 
-    # Las tablas principales están bajo secciones con un año (2026, 2025...).
-    # Las demás (escenarios hipotéticos, etc.) se descartan si existen las anuales.
-    if any(sec for _, _, sec in candidatas):
-        candidatas = [c for c in candidatas if c[2]]
-    print(f"Secciones usadas: {[sec for _, _, sec in candidatas]}")
+    # Las tablas sin año detectado se conservan (pueden llevar el año en las fechas)
+    # salvo que tengan partidos que no aparecen en ninguna tabla anual: eso indica
+    # un escenario hipotético (p. ej. FA en lugar de Sumar + Podemos).
+    def partidos_de(cab):
+        i0 = next((i for i, c in enumerate(cab) if c.startswith("Turnout")), 0)
+        i1 = next((i for i, c in enumerate(cab) if c.startswith("Lead")), len(cab))
+        return {c for c in cab[i0 + 1:i1] if c not in NO_PARTIDOS}
+    conocidos = set().union(*[partidos_de(c) for c, _, sec in candidatas if sec])
+    if conocidos:
+        filtradas = []
+        for c in candidatas:
+            extra = partidos_de(c[0]) - conocidos
+            if c[2] or not extra:
+                filtradas.append(c)
+            else:
+                print(f"  Descartada tabla sin año con partidos no habituales: {sorted(extra)}")
+        candidatas = filtradas
+    print(f"Años detectados: {[sec for _, _, sec in candidatas]}")
 
     # Wikipedia parte la tabla por años (2026, 2025...) y cada una puede tener
     # columnas distintas, así que se devuelven todas y se procesan por separado
@@ -229,10 +270,10 @@ def parse_voto(celda: str):
 
 
 def tabla_a_largo(df: pd.DataFrame) -> pd.DataFrame:
-    anyo = df.attrs.get("anyo")
     cols = list(df.columns)
     c_enc = cols[0]
     c_fecha = next(c for c in cols if c.startswith("Fieldwork"))
+    anyo = df.attrs.get("anyo") or anyo_mas_frecuente(df[c_fecha])
     c_muestra = next(c for c in cols if c.startswith("Sample"))
     c_part = next((c for c in cols if c.startswith("Turnout")), c_muestra)
     c_lead = next((c for c in cols if c.startswith("Lead")), None)
@@ -290,6 +331,8 @@ def media_movil(df: pd.DataFrame) -> pd.DataFrame:
               .pivot(index="Fecha_fin", columns="Partidos", values="PorcentajeMe")
               .reset_index())
     ancho.columns.name = None
+    if "PP" not in ancho:
+        return ancho.iloc[0:0]
     ancho = ancho[ancho["PP"].notna() & ancho["Fecha_fin"].dt.year.isin(ANYOS_MEDIA)]
     return ancho.reset_index(drop=True)
 
@@ -302,6 +345,8 @@ def media_semanal(df: pd.DataFrame) -> pd.DataFrame:
               .pivot(index="Fecha_fin", columns="Partidos", values="Porcentaje")
               .reset_index())
     ancho.columns.name = None
+    if "PP" not in ancho:
+        return ancho.iloc[0:0]
     ancho = ancho[ancho["Fecha_fin"].str[:4].isin(ANYOS_SEMANAL) & ancho["PP"].notna()]
     return ancho.reset_index(drop=True)
 
@@ -310,6 +355,9 @@ def media_semanal(df: pd.DataFrame) -> pd.DataFrame:
 # Datawrapper
 # --------------------------------------------------------------------------
 def dw_subir_y_publicar(chart_id: str, df: pd.DataFrame, nombre: str):
+    if df.empty:
+        print(f"Aviso: '{nombre}' sin datos; no se actualiza el gráfico", file=sys.stderr)
+        return
     csv = df.to_csv(index=False, date_format="%Y-%m-%d")
     if DRY_RUN:
         Path("salida").mkdir(exist_ok=True)
@@ -333,6 +381,9 @@ def main():
     if encuestas.empty:
         raise RuntimeError("No hay encuestas tras la limpieza; revisa la estructura de la tabla")
 
+    unicas = encuestas.drop_duplicates(["Encuestador", "Fecha_fin"])
+    print("Encuestas por año:", unicas.groupby(unicas["Fecha_fin"].dt.year).size().to_dict())
+    print("Más reciente:", encuestas["Fecha_fin"].max().date())
     dw_subir_y_publicar(CHART_ENCUESTAS, encuestas, "encuestas")
     dw_subir_y_publicar(CHART_MEDIA, media_movil(encuestas), "media_movil")
     dw_subir_y_publicar(CHART_SEMANAL, media_semanal(encuestas), "media_semanal")
