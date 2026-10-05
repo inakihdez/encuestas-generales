@@ -17,9 +17,11 @@ Variables de entorno:
   DRY_RUN=1             no sube nada; guarda los CSV en ./salida
 """
 
+import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -52,6 +54,7 @@ EXCLUIR_ENCUESTADORES = {"PP", "PSOE"}
 NO_PARTIDOS = {"Question", "X mark", "Others", "Other", "Blank", "Undecided", "Abstention"}
 
 DRY_RUN = os.getenv("DRY_RUN") == "1"
+RUTA_JSON = Path(os.getenv("RUTA_JSON") or "datos/encuestas.json")
 DW_API = "https://api.datawrapper.de/v3"
 HEADERS_WIKI = {"User-Agent": "EuropaPress-Encuestas/1.0 (GitHub Actions; datos@europapress.es)"}
 
@@ -364,9 +367,10 @@ def dw_subir_y_publicar(chart_id: str, df: pd.DataFrame, nombre: str):
         Path(f"salida/{nombre}.csv").write_text(csv, encoding="utf-8")
         print(f"[DRY_RUN] salida/{nombre}.csv ({len(df)} filas)")
         return
-    if chart_id == "XXXXX":
-        raise RuntimeError(f"Falta el id del gráfico '{nombre}'")
-    token = os.environ["DATAWRAPPER_API_KEY"]
+    token = os.getenv("DATAWRAPPER_API_KEY")
+    if chart_id == "XXXXX" or not token:
+        print(f"Datawrapper no configurado para '{nombre}'; se omite")
+        return
     auth = {"Authorization": f"Bearer {token}"}
     r = requests.put(f"{DW_API}/charts/{chart_id}/data", data=csv.encode("utf-8"),
                      headers={**auth, "Content-Type": "text/csv; charset=utf-8"}, timeout=60)
@@ -374,6 +378,70 @@ def dw_subir_y_publicar(chart_id: str, df: pd.DataFrame, nombre: str):
     r = requests.post(f"{DW_API}/charts/{chart_id}/publish", headers=auth, timeout=120)
     r.raise_for_status()
     print(f"Publicado {nombre} ({chart_id}): {len(df)} filas")
+
+
+# --------------------------------------------------------------------------
+# JSON para desarrollo propio
+# --------------------------------------------------------------------------
+def _num(v, decimales=2):
+    return None if pd.isna(v) else round(float(v), decimales)
+
+
+def _escanos(txt):
+    if txt is None or pd.isna(txt):
+        return None, None
+    n = [int(x) for x in str(txt).split("/")]
+    return n[0], n[-1]
+
+
+def _muestra(txt):
+    return int(txt) if isinstance(txt, str) and txt.isdigit() else None
+
+
+def construir_json(encuestas, media, semana) -> dict:
+    lista = []
+    for (enc, fecha, muestra), g in encuestas.groupby(
+            ["Encuestador", "Fecha_fin", "Muestra"], sort=False, dropna=False):
+        resultados = []
+        for _, r in g.iterrows():
+            e_min, e_max = _escanos(r["Diputados"])
+            resultados.append({"partido": r["Partidos"], "porcentaje": _num(r["Porcentaje"], 1),
+                               "escanos": r["Diputados"], "escanos_min": e_min, "escanos_max": e_max})
+        lista.append({"encuestador": enc, "fecha": fecha.strftime("%Y-%m-%d"),
+                      "muestra": _muestra(muestra), "resultados": resultados})
+
+    def ancho_a_lista(df, clave, fmt=None):
+        partidos = [c for c in df.columns if c != "Fecha_fin"]
+        return [{clave: (f.strftime(fmt) if fmt else f),
+                 **{p: _num(r[p]) for p in partidos}}
+                for f, (_, r) in zip(df["Fecha_fin"], df.iterrows())]
+
+    return {
+        "fuente": URLS[0],
+        "partidos": sorted(encuestas["Partidos"].unique().tolist()),
+        "media_movil": {"ventana": VENTANA_MEDIA,
+                        "datos": ancho_a_lista(media, "fecha", "%Y-%m-%d")},
+        "media_semanal": {"datos": ancho_a_lista(semana, "semana")},
+        "encuestas": lista,
+    }
+
+
+def guardar_json(datos: dict) -> bool:
+    """Escribe el JSON solo si los datos han cambiado (así no hay commits vacíos)."""
+    if RUTA_JSON.exists():
+        try:
+            previo = json.loads(RUTA_JSON.read_text(encoding="utf-8"))
+            previo.pop("actualizado", None)
+            if previo == json.loads(json.dumps(datos, ensure_ascii=False)):
+                print(f"{RUTA_JSON}: sin cambios")
+                return False
+        except (json.JSONDecodeError, OSError):
+            pass
+    salida = {"actualizado": datetime.now(timezone.utc).isoformat(timespec="seconds"), **datos}
+    RUTA_JSON.parent.mkdir(parents=True, exist_ok=True)
+    RUTA_JSON.write_text(json.dumps(salida, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    print(f"{RUTA_JSON}: actualizado ({RUTA_JSON.stat().st_size // 1024} KB, {len(datos['encuestas'])} encuestas)")
+    return True
 
 
 def main():
@@ -384,9 +452,12 @@ def main():
     unicas = encuestas.drop_duplicates(["Encuestador", "Fecha_fin"])
     print("Encuestas por año:", unicas.groupby(unicas["Fecha_fin"].dt.year).size().to_dict())
     print("Más reciente:", encuestas["Fecha_fin"].max().date())
+    media, semana = media_movil(encuestas), media_semanal(encuestas)
+    guardar_json(construir_json(encuestas, media, semana))
+
     dw_subir_y_publicar(CHART_ENCUESTAS, encuestas, "encuestas")
-    dw_subir_y_publicar(CHART_MEDIA, media_movil(encuestas), "media_movil")
-    dw_subir_y_publicar(CHART_SEMANAL, media_semanal(encuestas), "media_semanal")
+    dw_subir_y_publicar(CHART_MEDIA, media, "media_movil")
+    dw_subir_y_publicar(CHART_SEMANAL, semana, "media_semanal")
 
 
 if __name__ == "__main__":
