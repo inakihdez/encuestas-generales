@@ -69,7 +69,7 @@ class TablaNoEncontrada(RuntimeError):
     pass
 
 
-def obtener_tabla() -> pd.DataFrame:
+def obtener_tabla() -> list:
     """Prueba cada URL hasta encontrar una tabla de estimación de voto."""
     for url in URLS:
         r = requests.get(url, headers=HEADERS_WIKI, timeout=60)
@@ -131,7 +131,7 @@ def texto_cabecera(th) -> str:
     return limpiar(a.get("title", "")) if a else ""
 
 
-def leer_tabla_sondeos(html: str) -> pd.DataFrame:
+def leer_tabla_sondeos(html: str) -> list:
     soup = BeautifulSoup(html, "lxml")
     # Fuera notas al pie y textos ocultos (claves de ordenación)
     for el in soup.select("sup.reference, [style*='display:none'], [style*='display: none']"):
@@ -155,23 +155,21 @@ def leer_tabla_sondeos(html: str) -> pd.DataFrame:
     if not candidatas:
         raise TablaNoEncontrada("No hay tabla de estimación de voto (con columna Turnout)")
 
-    # La tabla principal es la más larga; se suman las que tengan la misma cabecera
-    # (por si Wikipedia la parte por años)
-    cab = max(candidatas, key=lambda x: len(x[1]))[0]
-    cab = [c or f"col_{i}" for i, c in enumerate(cab)]
-    registros = []
-    for c, rejilla in candidatas:
-        if [x or f"col_{i}" for i, x in enumerate(c)] != cab:
-            continue
+    # Wikipedia parte la tabla por años (2026, 2025...) y cada una puede tener
+    # columnas distintas, así que se devuelven todas y se procesan por separado
+    tablas = []
+    for cab, rejilla in candidatas:
+        cab = [c or f"col_{i}" for i, c in enumerate(cab)]
+        registros = []
         for fila in rejilla[1:]:
             fila = fila + [None] * (len(cab) - len(fila))
             if len(fila) != len(cab) or all(x is None or x.name == "th" for x in fila):
                 continue  # filas de cabecera / colores
             registros.append([limpiar(x.get_text(" ", strip=True)) if x is not None else "" for x in fila])
-
-    df = pd.DataFrame(registros, columns=cab)
-    print(f"Filas leídas: {len(df)} | Columnas: {cab}")
-    return df
+        if registros:
+            tablas.append(pd.DataFrame(registros, columns=cab))
+    print(f"Tablas usadas: {len(tablas)} | Filas totales: {sum(len(t) for t in tablas)}")
+    return tablas
 
 
 # --------------------------------------------------------------------------
@@ -206,7 +204,7 @@ def parse_voto(celda: str):
     return pct, esc
 
 
-def preparar_encuestas(df: pd.DataFrame) -> pd.DataFrame:
+def tabla_a_largo(df: pd.DataFrame) -> pd.DataFrame:
     cols = list(df.columns)
     c_enc = cols[0]
     c_fecha = next(c for c in cols if c.startswith("Fieldwork"))
@@ -215,14 +213,19 @@ def preparar_encuestas(df: pd.DataFrame) -> pd.DataFrame:
     c_lead = next((c for c in cols if c.startswith("Lead")), None)
     i_fin = cols.index(c_lead) if c_lead else len(cols)
     partidos = [c for c in cols[cols.index(c_part) + 1:i_fin] if c not in NO_PARTIDOS]
-    print(f"Partidos: {partidos}")
+    print(f"  Partidos: {partidos}")
 
     df = df.rename(columns={c_enc: "Encuestador", c_muestra: "Muestra"})
     df["Fecha_fin"] = df[c_fecha].map(parse_fecha_campo)
     df = df[["Encuestador", "Fecha_fin", "Muestra"] + partidos]
 
-    largo = df.melt(id_vars=["Encuestador", "Fecha_fin", "Muestra"],
-                    var_name="Partidos", value_name="Votos")
+    return df.melt(id_vars=["Encuestador", "Fecha_fin", "Muestra"],
+                   var_name="Partidos", value_name="Votos")
+
+
+def preparar_encuestas(tablas: list) -> pd.DataFrame:
+    largo = pd.concat([tabla_a_largo(t) for t in tablas], ignore_index=True)
+    largo = largo.drop_duplicates()
     largo["Muestra"] = largo["Muestra"].str.replace(",", "", regex=False)
     largo["Partidos"] = largo["Partidos"].replace(RENOMBRAR_PARTIDOS)
 
@@ -244,7 +247,7 @@ def preparar_encuestas(df: pd.DataFrame) -> pd.DataFrame:
     sin_fecha = largo["Fecha_fin"].isna()
     if sin_fecha.any():
         print("Aviso: fechas no reconocidas, se descartan:",
-              sorted(df.loc[df["Fecha_fin"].isna(), "Encuestador"].unique())[:10], file=sys.stderr)
+              sorted(largo.loc[sin_fecha, "Encuestador"].unique())[:10], file=sys.stderr)
         largo = largo[~sin_fecha]
 
     largo = largo.sort_values(["Fecha_fin", "Encuestador", "Porcentaje"],
