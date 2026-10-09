@@ -2,7 +2,7 @@ name: Encuestas elecciones generales
 
 on:
   schedule:
-    - cron: "0 7,15 * * *"   # 9:00 y 17:00 en horario de verano peninsular (UTC+2)
+    - cron: "7 7,19 * * *"   # ~8:00 y ~20:00 en Madrid (UTC+1)
   workflow_dispatch:
 
 permissions:
