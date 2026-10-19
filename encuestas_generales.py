@@ -49,6 +49,11 @@ ANYOS_SEMANAL = ["2025", "2026"]  # filtro del gráfico semanal
 # (filter(!is.na(Diputados))): solo encuestas con escaños.
 SOLO_CON_ESCANOS_DATAWRAPPER = True
 
+# Partidos que se tratan como la misma serie SOLO en los promedios (media móvil y
+# semanal). Las encuestas individuales conservan el nombre original de Wikipedia.
+# Frente Amplio (FA) sustituye a Sumar en las encuestas desde mediados de octubre de 2026.
+FUSIONAR_EN_PROMEDIOS = {"FA": "Sumar"}
+
 # Nombres de Wikipedia -> nombres en los gráficos
 RENOMBRAR_PARTIDOS = {"Vox": "VOX"}
 # Filas que no son encuestas (además de cualquier fila de resultados "... election")
@@ -329,6 +334,21 @@ def preparar_encuestas(tablas: list) -> pd.DataFrame:
     return largo.reset_index(drop=True)
 
 
+def para_promedios(df: pd.DataFrame) -> pd.DataFrame:
+    """Aplica FUSIONAR_EN_PROMEDIOS. Si una misma encuesta trae los dos nombres
+    (p. ej. Sumar y FA), se queda solo con el nuevo (FA) para no contarla dos veces.
+    No toca ninguna otra fila."""
+    if not FUSIONAR_EN_PROMEDIOS:
+        return df
+    d = df.copy().reset_index(drop=True)
+    renombrada = d["Partidos"].isin(FUSIONAR_EN_PROMEDIOS)
+    d["Partidos"] = d["Partidos"].replace(FUSIONAR_EN_PROMEDIOS)
+    claves = ["Encuestador", "Fecha_fin", "Muestra", "Partidos"]
+    con_nuevo = d.loc[renombrada, claves].drop_duplicates().assign(_hay=True)
+    choca = d[claves].merge(con_nuevo, on=claves, how="left")["_hay"].fillna(False).astype(bool)
+    return d[~(choca.values & ~renombrada.values)]
+
+
 def media_movil(df: pd.DataFrame) -> pd.DataFrame:
     m = (df.dropna(subset=["Porcentaje"])
            .groupby(["Fecha_fin", "Partidos"], as_index=False)["Porcentaje"].mean()
@@ -424,9 +444,10 @@ def construir_json(encuestas, media, semana) -> dict:
     return {
         "fuente": URLS[0],
         "partidos": sorted(encuestas["Partidos"].unique().tolist()),
-        "media_movil": {"ventana": VENTANA_MEDIA,
+        "media_movil": {"ventana": VENTANA_MEDIA, "fusiones": FUSIONAR_EN_PROMEDIOS,
                         "datos": ancho_a_lista(media, "fecha", "%Y-%m-%d")},
-        "media_semanal": {"datos": ancho_a_lista(semana, "semana")},
+        "media_semanal": {"fusiones": FUSIONAR_EN_PROMEDIOS,
+                          "datos": ancho_a_lista(semana, "semana")},
         "encuestas": lista,
     }
 
@@ -464,13 +485,14 @@ def main():
             f"{MAX_DIAS_SIN_ENCUESTAS} días: probablemente ha cambiado la página de "
             "Wikipedia. No se publica nada.")
     # JSON: todas las encuestas con % de voto
-    guardar_json(construir_json(encuestas, media_movil(encuestas), media_semanal(encuestas)))
+    prom = para_promedios(encuestas)
+    guardar_json(construir_json(encuestas, media_movil(prom), media_semanal(prom)))
 
     # Datawrapper: como en el script de R
     dw = encuestas[encuestas["Diputados"].notna()] if SOLO_CON_ESCANOS_DATAWRAPPER else encuestas
     dw_subir_y_publicar(CHART_ENCUESTAS, dw, "encuestas")
-    dw_subir_y_publicar(CHART_MEDIA, media_movil(dw), "media_movil")
-    dw_subir_y_publicar(CHART_SEMANAL, media_semanal(dw), "media_semanal")
+    dw_subir_y_publicar(CHART_MEDIA, media_movil(para_promedios(dw)), "media_movil")
+    dw_subir_y_publicar(CHART_SEMANAL, media_semanal(para_promedios(dw)), "media_semanal")
 
 
 if __name__ == "__main__":
