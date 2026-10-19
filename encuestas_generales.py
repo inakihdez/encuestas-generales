@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup
 
 # --------------------------------------------------------------------------
 # Configuración
@@ -57,6 +57,7 @@ EXCLUIR_ENCUESTADORES = {"PP", "PSOE"}
 NO_PARTIDOS = {"Question", "X mark", "Others", "Other", "Blank", "Undecided", "Abstention"}
 
 DRY_RUN = os.getenv("DRY_RUN") == "1"
+MAX_DIAS_SIN_ENCUESTAS = 30   # si la última encuesta es más antigua, la action falla
 RUTA_JSON = Path(os.getenv("RUTA_JSON") or "datos/encuestas.json")
 DW_API = "https://api.datawrapper.de/v3"
 HEADERS_WIKI = {"User-Agent": "EuropaPress-Encuestas/1.0 (GitHub Actions; datos@europapress.es)"}
@@ -137,27 +138,6 @@ def texto_cabecera(th) -> str:
     return re.sub(r"\s*\(.*?\)$", "", limpiar(a.get("title", ""))) if a else ""
 
 
-def anyo_seccion(tabla):
-    """Año de la tabla: caption, o un texto que sea solo un año ('2026') entre la
-    tabla anterior y esta (título de sección, negrita, div...). None si no hay."""
-    cap = tabla.find("caption")
-    if cap:
-        m = re.search(r"\b(20\d{2})\b", limpiar(cap.get_text(" ", strip=True)))
-        if m:
-            return m.group(1)
-    for i, el in enumerate(tabla.previous_elements):
-        if i > 400:
-            break
-        if isinstance(el, NavigableString):
-            padre = el.find_parent("table")
-            if padre is not None and padre is not tabla:
-                break  # hemos llegado a la tabla anterior
-            t = limpiar(str(el))
-            if re.fullmatch(r"20\d{2}", t):
-                return t
-    return None
-
-
 def titulo_seccion(tabla) -> str:
     h = tabla.find_previous(["h2", "h3", "h4"])
     return limpiar(h.get_text(" ", strip=True)) if h else ""
@@ -166,63 +146,43 @@ def titulo_seccion(tabla) -> str:
 ESCENARIOS = re.compile(r"hypothetical|scenario|alternative|if .* ran", re.I)
 
 
-def anyo_mas_frecuente(fechas: pd.Series):
-    anyos = fechas.str.findall(r"\b(20\d{2})\b").explode().dropna()
-    return anyos.mode().iloc[0] if not anyos.empty else None
-
-
 def leer_tabla_sondeos(html: str) -> list:
     soup = BeautifulSoup(html, "lxml")
     # Fuera notas al pie y textos ocultos (claves de ordenación)
     for el in soup.select("sup.reference, [style*='display:none'], [style*='display: none']"):
         el.decompose()
 
-    candidatas = []
+    # Las tablas de estimación de voto (una por año: 2026, 2025...) van seguidas al
+    # principio de la página. Se toma ese primer bloque contiguo de tablas con
+    # columna Turnout; lo que viene después (voto directo, escenarios con FA...) se ignora.
+    candidatas, bloque_cerrado = [], False
     for tabla in soup.select("table.wikitable"):
         rejilla = expandir_tabla(tabla)
         if not rejilla:
             continue
         cab = [texto_cabecera(c) for c in rejilla[0]]
-        if (any(c.startswith("Polling firm") for c in cab)
+        if not (any(c.startswith("Polling firm") for c in cab)
                 and any(c.startswith("Fieldwork") for c in cab)
                 and "PP" in cab and "PSOE" in cab):
-            # Solo las tablas de estimación de voto tienen columna Turnout;
-            # las de voto directo, preferencias, etc. se descartan
-            valida = any(c.startswith("Turnout") for c in cab)
-            seccion = anyo_seccion(tabla)
-            titulo = titulo_seccion(tabla)
-            escenario = bool(ESCENARIOS.search(titulo))
-            estado = "OK" if valida and not escenario else ("escenario" if escenario else "sin Turnout")
-            print(f"  Tabla {estado} | año {seccion or '-'} | título «{titulo}» "
-                  f"| {len(rejilla)} filas | {cab}")
-            if valida and not escenario:
-                candidatas.append((cab, rejilla, seccion))
+            continue
+        titulo = titulo_seccion(tabla)
+        valida = (any(c.startswith("Turnout") for c in cab)
+                  and not ESCENARIOS.search(titulo))
+        if valida and not bloque_cerrado:
+            estado = "OK"
+            candidatas.append((cab, rejilla))
+        else:
+            estado = "fuera del bloque principal" if valida else "descartada"
+            if candidatas:
+                bloque_cerrado = True
+        print(f"  Tabla {estado} | título «{titulo}» | {len(rejilla)} filas | {cab}")
     if not candidatas:
         raise TablaNoEncontrada("No hay tabla de estimación de voto (con columna Turnout)")
-
-    # Las tablas sin año detectado se conservan (pueden llevar el año en las fechas)
-    # salvo que tengan partidos que no aparecen en ninguna tabla anual: eso indica
-    # un escenario hipotético (p. ej. FA en lugar de Sumar + Podemos).
-    def partidos_de(cab):
-        i0 = next((i for i, c in enumerate(cab) if c.startswith("Turnout")), 0)
-        i1 = next((i for i, c in enumerate(cab) if c.startswith("Lead")), len(cab))
-        return {c for c in cab[i0 + 1:i1] if c not in NO_PARTIDOS}
-    conocidos = set().union(*[partidos_de(c) for c, _, sec in candidatas if sec])
-    if conocidos:
-        filtradas = []
-        for c in candidatas:
-            extra = partidos_de(c[0]) - conocidos
-            if c[2] or not extra:
-                filtradas.append(c)
-            else:
-                print(f"  Descartada tabla sin año con partidos no habituales: {sorted(extra)}")
-        candidatas = filtradas
-    print(f"Años detectados: {[sec for _, _, sec in candidatas]}")
 
     # Wikipedia parte la tabla por años (2026, 2025...) y cada una puede tener
     # columnas distintas, así que se devuelven todas y se procesan por separado
     tablas = []
-    for cab, rejilla, seccion in candidatas:
+    for cab, rejilla in candidatas:
         cab = [c or f"col_{i}" for i, c in enumerate(cab)]
         registros = []
         for fila in rejilla[1:]:
@@ -231,35 +191,80 @@ def leer_tabla_sondeos(html: str) -> list:
                 continue  # filas de cabecera / colores
             registros.append([limpiar(x.get_text(" ", strip=True)) if x is not None else "" for x in fila])
         if registros:
-            t = pd.DataFrame(registros, columns=cab)
-            t.attrs["anyo"] = seccion
-            tablas.append(t)
+            tablas.append(pd.DataFrame(registros, columns=cab))
     print(f"Tablas usadas: {len(tablas)} | Filas totales: {sum(len(t) for t in tablas)}")
+    asignar_fechas(tablas)
     return tablas
 
 
 # --------------------------------------------------------------------------
 # Limpieza
 # --------------------------------------------------------------------------
-def parse_fecha_campo(x: str, anyo_defecto=None):
-    """'24–26 Sep 2026' -> 2026-09-26 ; '28 Dec 2025–3 Jan 2026' -> 2026-01-03
-    '29 Sep–1 Oct' en la tabla de 2026 -> 2026-10-01 (año de la sección)"""
-    x = limpiar(x)
-    segunda = re.split(r"[–—-]", x)[-1].strip()
-    if not re.search(r"\d{4}", segunda):
-        anyo = re.search(r"(\d{4})$", x)
-        if anyo:
-            segunda = f"{segunda} {anyo.group(1)}"
-        elif anyo_defecto:
-            segunda = f"{segunda} {anyo_defecto}"
-        else:
-            return pd.NaT
-    for fmt in ("%d %b %Y", "%d %B %Y"):
-        try:
-            return pd.to_datetime(segunda, format=fmt)
-        except (ValueError, TypeError):
-            pass
-    return pd.to_datetime(segunda, errors="coerce", dayfirst=True)
+MESES = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+PATRON_FIN = re.compile(r"(\d{1,2})\s+([A-Za-z]{3,9})\.?(?:\s+(\d{4}))?$")
+
+
+def fin_de_campo(x: str):
+    """Último día del trabajo de campo como (día, mes, año o None).
+    '25–28 Sep' -> (28, 9, None) ; '28 Dec 2025–3 Jan 2026' -> (3, 1, 2026)"""
+    segunda = re.split(r"[–—-]", limpiar(x))[-1].strip()
+    m = PATRON_FIN.search(segunda)
+    if not m or m.group(2)[:3].lower() not in MESES:
+        return None
+    return int(m.group(1)), MESES[m.group(2)[:3].lower()], int(m.group(3)) if m.group(3) else None
+
+
+def _fecha(anyo, mes, dia):
+    try:
+        return pd.Timestamp(year=anyo, month=mes, day=dia)
+    except ValueError:
+        return None
+
+
+def hoy() -> pd.Timestamp:
+    return pd.Timestamp(os.getenv("HOY") or datetime.now(timezone.utc).date())
+
+
+def asignar_fechas(tablas: list):
+    """Añade la columna Fecha_fin. Wikipedia no suele poner el año en las fechas
+    («6–9 Oct»), así que se deduce: las encuestas van de más reciente a más antigua,
+    se parte de hoy y, cuando una fecha 'salta' hacia delante (de «3 Jan» a «29 Dec»),
+    se resta un año. Si la fecha trae el año escrito, manda ese."""
+    anyo, previa = hoy().year, None
+    tope_inicial = hoy() + pd.Timedelta(days=2)
+    for t in tablas:
+        c_fecha = next(c for c in t.columns if c.startswith("Fieldwork"))
+        fechas = []
+        for x in t[c_fecha]:
+            partes = fin_de_campo(x)
+            if partes is None:
+                fechas.append(pd.NaT)
+                continue
+            dia, mes, explicito = partes
+            if explicito:
+                anyo = explicito
+                f = _fecha(anyo, mes, dia)
+            else:
+                f = _fecha(anyo, mes, dia)
+                if previa is None:
+                    while f is not None and f > tope_inicial:
+                        anyo -= 1
+                        f = _fecha(anyo, mes, dia)
+                elif f is not None and f > previa + pd.Timedelta(days=60):
+                    if previa.month <= 2 and mes >= 11:
+                        # cambio de año real: de enero/febrero a noviembre/diciembre
+                        anyo -= 1
+                        f = _fecha(anyo, mes, dia)
+                    else:
+                        # fila desordenada: se queda en el año en curso y no mueve la cadena
+                        print(f"  Aviso: fila fuera de orden «{x}» -> {f.date()}", file=sys.stderr)
+                        fechas.append(f)
+                        continue
+            if f is not None:
+                previa = f
+            fechas.append(f if f is not None else pd.NaT)
+        t["Fecha_fin"] = pd.to_datetime(pd.Series(fechas, index=t.index))
 
 
 # porcentaje (o ?) + escaños opcionales (137, 134/146, 134–146)
@@ -278,17 +283,17 @@ def parse_voto(celda: str):
 def tabla_a_largo(df: pd.DataFrame) -> pd.DataFrame:
     cols = list(df.columns)
     c_enc = cols[0]
-    c_fecha = next(c for c in cols if c.startswith("Fieldwork"))
-    anyo = df.attrs.get("anyo") or anyo_mas_frecuente(df[c_fecha])
     c_muestra = next(c for c in cols if c.startswith("Sample"))
     c_part = next((c for c in cols if c.startswith("Turnout")), c_muestra)
     c_lead = next((c for c in cols if c.startswith("Lead")), None)
     i_fin = cols.index(c_lead) if c_lead else len(cols)
-    partidos = [c for c in cols[cols.index(c_part) + 1:i_fin] if c not in NO_PARTIDOS]
-    print(f"  Tabla {anyo or '-'} | partidos: {partidos}")
+    partidos = [c for c in cols[cols.index(c_part) + 1:i_fin]
+                if c not in NO_PARTIDOS and c != "Fecha_fin"]
+    fechas = df["Fecha_fin"].dropna()
+    rango = f"{fechas.min().date()} → {fechas.max().date()}" if not fechas.empty else "sin fechas"
+    print(f"  Tabla {rango} | partidos: {partidos}")
 
     df = df.rename(columns={c_enc: "Encuestador", c_muestra: "Muestra"})
-    df["Fecha_fin"] = df[c_fecha].map(lambda x: parse_fecha_campo(x, anyo))
     df = df[["Encuestador", "Fecha_fin", "Muestra"] + partidos]
 
     return df.melt(id_vars=["Encuestador", "Fecha_fin", "Muestra"],
@@ -451,7 +456,13 @@ def main():
 
     unicas = encuestas.drop_duplicates(["Encuestador", "Fecha_fin"])
     print("Encuestas por año:", unicas.groupby(unicas["Fecha_fin"].dt.year).size().to_dict())
-    print("Más reciente:", encuestas["Fecha_fin"].max().date())
+    ultima = encuestas["Fecha_fin"].max()
+    print("Más reciente:", ultima.date())
+    if (hoy() - ultima).days > MAX_DIAS_SIN_ENCUESTAS:
+        raise RuntimeError(
+            f"La encuesta más reciente es del {ultima.date()}, hace más de "
+            f"{MAX_DIAS_SIN_ENCUESTAS} días: probablemente ha cambiado la página de "
+            "Wikipedia. No se publica nada.")
     # JSON: todas las encuestas con % de voto
     guardar_json(construir_json(encuestas, media_movil(encuestas), media_semanal(encuestas)))
 
