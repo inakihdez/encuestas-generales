@@ -45,8 +45,8 @@ CHART_SEMANAL = os.getenv("DW_CHART_SEMANAL") or "XXXXX"
 # ponderada por antigüedad (el peso se reduce a la mitad cada VIDA_MEDIA_DIAS).
 VENTANA_DIAS = 45
 VIDA_MEDIA_DIAS = 14
-VIDA_MEDIA_CAMPANA_DIAS = 7                     # campaña: reacciona antes
-INICIO_CAMPANA = pd.Timestamp("2026-11-13")     # campaña del 29N: 13–27 de noviembre
+VIDA_MEDIA_ELECTORAL_DIAS = 7                   # desde la convocatoria: reacciona antes
+INICIO_PERIODO_ELECTORAL = pd.Timestamp("2026-10-05")   # anuncio de las elecciones del 29N
 MIN_CASAS = 3                                   # empresas mínimas para dar media de un partido
 ANYOS_MEDIA = [2026]              # filtro del gráfico de media móvil
 ANYOS_SEMANAL = ["2025", "2026"]  # filtro del gráfico semanal
@@ -363,7 +363,7 @@ def casa_encuestadora(encuestador: str) -> str:
 def media_movil(df: pd.DataFrame) -> pd.DataFrame:
     """Para cada fecha con encuestas y cada partido: se toma la última encuesta de cada
     empresa en los VENTANA_DIAS anteriores y se hace una media ponderada por antigüedad,
-    con peso 0,5 ** (días / vida media). La vida media baja durante la campaña."""
+    con peso 0,5 ** (días / vida media). La vida media baja desde el anuncio de las elecciones."""
     d = df.dropna(subset=["Porcentaje"]).copy()
     d["Casa"] = d["Encuestador"].map(casa_encuestadora)
     d["Porcentaje"] = d["Porcentaje"].astype(float)
@@ -374,7 +374,7 @@ def media_movil(df: pd.DataFrame) -> pd.DataFrame:
     filas = []
     for f in fechas:
         f = pd.Timestamp(f)
-        vida = VIDA_MEDIA_CAMPANA_DIAS if f >= INICIO_CAMPANA else VIDA_MEDIA_DIAS
+        vida = VIDA_MEDIA_ELECTORAL_DIAS if f >= INICIO_PERIODO_ELECTORAL else VIDA_MEDIA_DIAS
         v = base[(base["Fecha_fin"] <= f) & (base["Fecha_fin"] > f - pd.Timedelta(days=VENTANA_DIAS))]
         v = v.sort_values("Fecha_fin").groupby(["Partidos", "Casa"]).tail(1)
         peso = 0.5 ** ((f - v["Fecha_fin"]).dt.days / vida)
@@ -473,8 +473,8 @@ def construir_json(encuestas, media, semana) -> dict:
         "partidos": sorted(encuestas["Partidos"].unique().tolist()),
         "media_movil": {"metodo": "última encuesta de cada empresa, ponderada por antigüedad",
                         "ventana_dias": VENTANA_DIAS, "vida_media_dias": VIDA_MEDIA_DIAS,
-                        "vida_media_campana_dias": VIDA_MEDIA_CAMPANA_DIAS,
-                        "inicio_campana": INICIO_CAMPANA.strftime("%Y-%m-%d"),
+                        "vida_media_periodo_electoral_dias": VIDA_MEDIA_ELECTORAL_DIAS,
+                        "inicio_periodo_electoral": INICIO_PERIODO_ELECTORAL.strftime("%Y-%m-%d"),
                         "min_empresas": MIN_CASAS, "fusiones": FUSIONAR_EN_PROMEDIOS,
                         "datos": ancho_a_lista(media, "fecha", "%Y-%m-%d")},
         "media_semanal": {"fusiones": FUSIONAR_EN_PROMEDIOS,
