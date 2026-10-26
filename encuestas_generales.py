@@ -41,7 +41,13 @@ CHART_ENCUESTAS = os.getenv("DW_CHART_ENCUESTAS") or "XXXXX"
 CHART_MEDIA = os.getenv("DW_CHART_MEDIA") or "XXXXX"
 CHART_SEMANAL = os.getenv("DW_CHART_SEMANAL") or "XXXXX"
 
-VENTANA_MEDIA = 5                 # zoo::rollmean(k = 5)
+# Media móvil: última encuesta de cada empresa en los últimos VENTANA_DIAS días,
+# ponderada por antigüedad (el peso se reduce a la mitad cada VIDA_MEDIA_DIAS).
+VENTANA_DIAS = 45
+VIDA_MEDIA_DIAS = 14
+VIDA_MEDIA_CAMPANA_DIAS = 7                     # campaña: reacciona antes
+INICIO_CAMPANA = pd.Timestamp("2026-11-13")     # campaña del 29N: 13–27 de noviembre
+MIN_CASAS = 3                                   # empresas mínimas para dar media de un partido
 ANYOS_MEDIA = [2026]              # filtro del gráfico de media móvil
 ANYOS_SEMANAL = ["2025", "2026"]  # filtro del gráfico semanal
 # El JSON incluye todas las encuestas con % de voto (tengan o no escaños).
@@ -349,20 +355,41 @@ def para_promedios(df: pd.DataFrame) -> pd.DataFrame:
     return d[~(choca.values & ~renombrada.values)]
 
 
+def casa_encuestadora(encuestador: str) -> str:
+    """'SocioMétrica/El Español' -> 'SocioMétrica' (la empresa, sin el medio que la encarga)."""
+    return limpiar(str(encuestador).split("/")[0])
+
+
 def media_movil(df: pd.DataFrame) -> pd.DataFrame:
-    m = (df.dropna(subset=["Porcentaje"])
-           .groupby(["Fecha_fin", "Partidos"], as_index=False)["Porcentaje"].mean()
-           .sort_values(["Partidos", "Fecha_fin"]))
-    m["PorcentajeMe"] = (m.groupby("Partidos")["Porcentaje"]
-                          .transform(lambda s: s.rolling(VENTANA_MEDIA, min_periods=VENTANA_MEDIA).mean()))
-    ancho = (m.dropna(subset=["PorcentajeMe"])
-              .pivot(index="Fecha_fin", columns="Partidos", values="PorcentajeMe")
-              .reset_index())
-    ancho.columns.name = None
+    """Para cada fecha con encuestas y cada partido: se toma la última encuesta de cada
+    empresa en los VENTANA_DIAS anteriores y se hace una media ponderada por antigüedad,
+    con peso 0,5 ** (días / vida media). La vida media baja durante la campaña."""
+    d = df.dropna(subset=["Porcentaje"]).copy()
+    d["Casa"] = d["Encuestador"].map(casa_encuestadora)
+    d["Porcentaje"] = d["Porcentaje"].astype(float)
+    # Variantes de una misma encuesta (mismo día y empresa) se promedian en una
+    base = d.groupby(["Partidos", "Casa", "Fecha_fin"], as_index=False)["Porcentaje"].mean()
+
+    fechas = sorted(d.loc[d["Fecha_fin"].dt.year.isin(ANYOS_MEDIA), "Fecha_fin"].unique())
+    filas = []
+    for f in fechas:
+        f = pd.Timestamp(f)
+        vida = VIDA_MEDIA_CAMPANA_DIAS if f >= INICIO_CAMPANA else VIDA_MEDIA_DIAS
+        v = base[(base["Fecha_fin"] <= f) & (base["Fecha_fin"] > f - pd.Timedelta(days=VENTANA_DIAS))]
+        v = v.sort_values("Fecha_fin").groupby(["Partidos", "Casa"]).tail(1)
+        peso = 0.5 ** ((f - v["Fecha_fin"]).dt.days / vida)
+        g = (v.assign(peso=peso, pond=peso * v["Porcentaje"])
+               .groupby("Partidos").agg(pond=("pond", "sum"), peso=("peso", "sum"), casas=("Casa", "nunique")))
+        g = g[g["casas"] >= MIN_CASAS]
+        filas.append({"Fecha_fin": f, **(g["pond"] / g["peso"]).to_dict()})
+
+    if not filas:
+        return pd.DataFrame(columns=["Fecha_fin"])
+    ancho = pd.DataFrame(filas)
+    ancho = ancho[["Fecha_fin"] + sorted(c for c in ancho.columns if c != "Fecha_fin")]
     if "PP" not in ancho:
         return ancho.iloc[0:0]
-    ancho = ancho[ancho["PP"].notna() & ancho["Fecha_fin"].dt.year.isin(ANYOS_MEDIA)]
-    return ancho.reset_index(drop=True)
+    return ancho[ancho["PP"].notna()].reset_index(drop=True)
 
 
 def media_semanal(df: pd.DataFrame) -> pd.DataFrame:
@@ -444,7 +471,11 @@ def construir_json(encuestas, media, semana) -> dict:
     return {
         "fuente": URLS[0],
         "partidos": sorted(encuestas["Partidos"].unique().tolist()),
-        "media_movil": {"ventana": VENTANA_MEDIA, "fusiones": FUSIONAR_EN_PROMEDIOS,
+        "media_movil": {"metodo": "última encuesta de cada empresa, ponderada por antigüedad",
+                        "ventana_dias": VENTANA_DIAS, "vida_media_dias": VIDA_MEDIA_DIAS,
+                        "vida_media_campana_dias": VIDA_MEDIA_CAMPANA_DIAS,
+                        "inicio_campana": INICIO_CAMPANA.strftime("%Y-%m-%d"),
+                        "min_empresas": MIN_CASAS, "fusiones": FUSIONAR_EN_PROMEDIOS,
                         "datos": ancho_a_lista(media, "fecha", "%Y-%m-%d")},
         "media_semanal": {"fusiones": FUSIONAR_EN_PROMEDIOS,
                           "datos": ancho_a_lista(semana, "semana")},
