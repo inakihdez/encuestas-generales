@@ -59,6 +59,10 @@ SOLO_CON_ESCANOS_DATAWRAPPER = True
 # semanal). Las encuestas individuales conservan el nombre original de Wikipedia.
 # Frente Amplio (FA) sustituye a Sumar en las encuestas desde mediados de octubre de 2026.
 FUSIONAR_EN_PROMEDIOS = {"FA": "Sumar"}
+# Partidos que se SUMAN a otro en los promedios cuando la encuesta los da por separado.
+# Front Valencià (FV) se suma a FA para que la serie sea siempre «FA + FV», igual que
+# en las encuestas que publican un único dato conjunto (celda combinada en Wikipedia).
+SUMAR_EN_PROMEDIOS = {"FV": "FA"}
 
 # Nombres de Wikipedia -> nombres en los gráficos
 RENOMBRAR_PARTIDOS = {"Vox": "VOX"}
@@ -192,18 +196,42 @@ def leer_tabla_sondeos(html: str) -> list:
 
     # Wikipedia parte la tabla por años (2026, 2025...) y cada una puede tener
     # columnas distintas, así que se devuelven todas y se procesan por separado
-    tablas = []
-    for cab, rejilla in candidatas:
+    tablas, seguimientos = [], 0
+    for n_tabla, (cab, rejilla) in enumerate(candidatas):
         cab = [c or f"col_{i}" for i, c in enumerate(cab)]
-        registros = []
-        for fila in rejilla[1:]:
+        i_fecha = next(i for i, c in enumerate(cab) if c.startswith("Fieldwork"))
+        registros, previa = [], None
+        for n_fila, fila in enumerate(rejilla[1:]):
             fila = fila + [None] * (len(cab) - len(fila))
             if len(fila) != len(cab) or all(x is None or x.name == "th" for x in fila):
+                previa = fila
                 continue  # filas de cabecera / colores
-            registros.append([limpiar(x.get_text(" ", strip=True)) if x is not None else "" for x in fila])
+            # Seguimiento diario (p. ej. SW Demoscopia): fila que hereda la empresa de la
+            # anterior (rowspan) pero tiene fecha propia. No es una encuesta, se descarta.
+            # Las variantes de una misma encuesta (empresa y fecha heredadas) se mantienen.
+            if (previa is not None and fila[0] is not None and fila[0] is previa[0]
+                    and fila[i_fecha] is not previa[i_fecha]):
+                seguimientos += 1
+                previa = fila
+                continue
+            textos, conjuntos = [], {}
+            i = 0
+            while i < len(fila):
+                x, j = fila[i], i
+                while x is not None and j + 1 < len(fila) and fila[j + 1] is x:
+                    j += 1  # celda combinada (colspan) que ocupa varias columnas
+                texto = limpiar(x.get_text(" ", strip=True)) if x is not None else ""
+                # El dato va solo en la primera columna; las demás quedan vacías
+                textos += [texto] + [""] * (j - i)
+                if j > i and parse_voto(texto) != (None, None):
+                    conjuntos[cab[i]] = cab[i:j + 1]
+                i = j + 1
+            registros.append(textos + [conjuntos, f"{n_tabla}-{n_fila}"])
+            previa = fila
         if registros:
-            tablas.append(pd.DataFrame(registros, columns=cab))
-    print(f"Tablas usadas: {len(tablas)} | Filas totales: {sum(len(t) for t in tablas)}")
+            tablas.append(pd.DataFrame(registros, columns=cab + ["_conjuntos", "_id"]))
+    print(f"Tablas usadas: {len(tablas)} | Filas totales: {sum(len(t) for t in tablas)}"
+          f" | filas de seguimiento diario descartadas: {seguimientos}")
     asignar_fechas(tablas)
     return tablas
 
@@ -299,21 +327,37 @@ def tabla_a_largo(df: pd.DataFrame) -> pd.DataFrame:
     c_lead = next((c for c in cols if c.startswith("Lead")), None)
     i_fin = cols.index(c_lead) if c_lead else len(cols)
     partidos = [c for c in cols[cols.index(c_part) + 1:i_fin]
-                if c not in NO_PARTIDOS and c != "Fecha_fin"]
+                if c not in NO_PARTIDOS and c not in ("Fecha_fin", "_conjuntos", "_id")]
     fechas = df["Fecha_fin"].dropna()
     rango = f"{fechas.min().date()} → {fechas.max().date()}" if not fechas.empty else "sin fechas"
     print(f"  Tabla {rango} | partidos: {partidos}")
 
     df = df.rename(columns={c_enc: "Encuestador", c_muestra: "Muestra"})
-    df = df[["Encuestador", "Fecha_fin", "Muestra"] + partidos]
+    df = df[["Encuestador", "Fecha_fin", "Muestra", "_id", "_conjuntos"] + partidos]
 
-    return df.melt(id_vars=["Encuestador", "Fecha_fin", "Muestra"],
-                   var_name="Partidos", value_name="Votos")
+    largo = df.melt(id_vars=["Encuestador", "Fecha_fin", "Muestra", "_id", "_conjuntos"],
+                    var_name="Partidos", value_name="Votos")
+    # «FA+FV» cuando el dato publicado es conjunto (celda combinada); "" si no
+    largo["Conjunto"] = [
+        "+".join(RENOMBRAR_PARTIDOS.get(p, p) for p in c[partido]) if partido in c else ""
+        for c, partido in zip(largo["_conjuntos"], largo["Partidos"])]
+    return largo.drop(columns="_conjuntos")
 
 
 def preparar_encuestas(tablas: list) -> pd.DataFrame:
     largo = pd.concat([tabla_a_largo(t) for t in tablas], ignore_index=True)
-    largo = largo.drop_duplicates()
+    # Encuestas repetidas (misma empresa, fecha, muestra y todos los datos iguales,
+    # p. ej. si aparecen en dos tablas): se compara la encuesta entera, no fila a fila,
+    # para no perder datos de las variantes de una misma encuesta.
+    firma = (largo.sort_values(["_id", "Partidos"])
+                  .groupby("_id", sort=False)
+                  .apply(lambda g: (g["Encuestador"].iat[0], str(g["Fecha_fin"].iat[0]), g["Muestra"].iat[0],
+                                    tuple(zip(g["Partidos"], g["Votos"], g["Conjunto"]))),
+                         include_groups=False))
+    repetidas = firma[firma.duplicated()].index
+    if len(repetidas):
+        print(f"Encuestas repetidas descartadas: {len(repetidas)}")
+    largo = largo[~largo["_id"].isin(repetidas)]
     largo["Muestra"] = largo["Muestra"].str.replace(",", "", regex=False)
     largo["Partidos"] = largo["Partidos"].replace(RENOMBRAR_PARTIDOS)
 
@@ -341,12 +385,28 @@ def preparar_encuestas(tablas: list) -> pd.DataFrame:
 
 
 def para_promedios(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica FUSIONAR_EN_PROMEDIOS. Si una misma encuesta trae los dos nombres
+    """Aplica SUMAR_EN_PROMEDIOS (FV se suma a FA) y FUSIONAR_EN_PROMEDIOS (FA es la
+    continuación de Sumar). Si una misma encuesta trae los dos nombres
     (p. ej. Sumar y FA), se queda solo con el nuevo (FA) para no contarla dos veces.
     No toca ninguna otra fila."""
-    if not FUSIONAR_EN_PROMEDIOS:
-        return df
     d = df.copy().reset_index(drop=True)
+    if "Conjunto" not in d:
+        d["Conjunto"] = ""
+    if "_id" not in d:
+        d["_id"] = d["Encuestador"].astype(str) + d["Fecha_fin"].astype(str) + d["Muestra"].astype(str)
+
+    # FV se suma a FA cuando la encuesta los da por separado; si el dato ya es
+    # conjunto (FA+FV en una celda), se deja como está
+    for origen, destino in SUMAR_EN_PROMEDIOS.items():
+        sueltos = d[(d["Partidos"] == origen) & (d["Conjunto"] == "") & d["Porcentaje"].notna()]
+        suma = sueltos.groupby("_id")["Porcentaje"].sum()
+        es_destino = (d["Partidos"] == destino) & (d["Conjunto"] == "")
+        extra = d.loc[es_destino, "_id"].map(suma).fillna(0).astype("Float64")
+        d.loc[es_destino, "Porcentaje"] = d.loc[es_destino, "Porcentaje"] + extra
+        d = d[d["Partidos"] != origen].reset_index(drop=True)
+
+    if not FUSIONAR_EN_PROMEDIOS:
+        return d
     renombrada = d["Partidos"].isin(FUSIONAR_EN_PROMEDIOS)
     d["Partidos"] = d["Partidos"].replace(FUSIONAR_EN_PROMEDIOS)
     claves = ["Encuestador", "Fecha_fin", "Muestra", "Partidos"]
@@ -452,13 +512,17 @@ def _muestra(txt):
 
 def construir_json(encuestas, media, semana) -> dict:
     lista = []
-    for (enc, fecha, muestra), g in encuestas.groupby(
-            ["Encuestador", "Fecha_fin", "Muestra"], sort=False, dropna=False):
+    for _, g in encuestas.groupby("_id", sort=False):
+        enc, fecha, muestra = g.iloc[0][["Encuestador", "Fecha_fin", "Muestra"]]
         resultados = []
         for _, r in g.iterrows():
             e_min, e_max = _escanos(r["Diputados"])
-            resultados.append({"partido": r["Partidos"], "porcentaje": _num(r["Porcentaje"], 1),
-                               "escanos": None if pd.isna(r["Diputados"]) else r["Diputados"], "escanos_min": e_min, "escanos_max": e_max})
+            res = {"partido": r["Partidos"], "porcentaje": _num(r["Porcentaje"], 1),
+                   "escanos": None if pd.isna(r["Diputados"]) else r["Diputados"],
+                   "escanos_min": e_min, "escanos_max": e_max}
+            if r.get("Conjunto"):
+                res["conjunto"] = r["Conjunto"].split("+")   # p. ej. ["FA", "FV"]
+            resultados.append(res)
         lista.append({"encuestador": enc, "fecha": fecha.strftime("%Y-%m-%d"),
                       "muestra": _muestra(muestra), "resultados": resultados})
 
@@ -476,8 +540,9 @@ def construir_json(encuestas, media, semana) -> dict:
                         "vida_media_periodo_electoral_dias": VIDA_MEDIA_ELECTORAL_DIAS,
                         "inicio_periodo_electoral": INICIO_PERIODO_ELECTORAL.strftime("%Y-%m-%d"),
                         "min_empresas": MIN_CASAS, "fusiones": FUSIONAR_EN_PROMEDIOS,
+                        "sumas": SUMAR_EN_PROMEDIOS,
                         "datos": ancho_a_lista(media, "fecha", "%Y-%m-%d")},
-        "media_semanal": {"fusiones": FUSIONAR_EN_PROMEDIOS,
+        "media_semanal": {"fusiones": FUSIONAR_EN_PROMEDIOS, "sumas": SUMAR_EN_PROMEDIOS,
                           "datos": ancho_a_lista(semana, "semana")},
         "encuestas": lista,
     }
@@ -521,7 +586,7 @@ def main():
 
     # Datawrapper: como en el script de R
     dw = encuestas[encuestas["Diputados"].notna()] if SOLO_CON_ESCANOS_DATAWRAPPER else encuestas
-    dw_subir_y_publicar(CHART_ENCUESTAS, dw, "encuestas")
+    dw_subir_y_publicar(CHART_ENCUESTAS, dw.drop(columns=["_id", "Conjunto"]), "encuestas")
     dw_subir_y_publicar(CHART_MEDIA, media_movil(para_promedios(dw)), "media_movil")
     dw_subir_y_publicar(CHART_SEMANAL, media_semanal(para_promedios(dw)), "media_semanal")
 
